@@ -20,6 +20,25 @@ import (
 // Global channel for sending messages from transfer goroutines to the program
 var transferChannel chan tea.Msg
 
+// getHostKeyCallback attempts to create a host key callback from the known_hosts file.
+// It returns the callback and an error if the known_hosts file itself is problematic
+// (e.g., permissions, corruption). If the file doesn't exist, it returns a valid callback
+// that will then produce a KeyError for unknown hosts, and a nil error.
+func getHostKeyCallback() (ssh.HostKeyCallback, error) {
+	knownHostsPath := filepath.Join(os.Getenv("HOME"), ".ssh", "known_hosts")
+	// Attempt to create a known_hosts callback.
+	// If knownHostsPath does not exist, knownhosts.New returns a callback that treats all hosts as unknown
+	// and err will be nil. This is desired behavior, as it will trigger a KeyError.
+	// If knownHostsPath exists but is malformed or has permission issues, knownhosts.New returns an error.
+	callback, err := knownhosts.New(knownHostsPath)
+	if err != nil {
+		// This error indicates a problem with the known_hosts file itself (e.g., malformed, permissions).
+		Warn("Error initializing known_hosts verification from %s: %v. You may be prompted for keys more often or connections may fail.", knownHostsPath, err)
+		return nil, fmt.Errorf("error processing known_hosts file at %s: %w", knownHostsPath, err)
+	}
+	return callback, nil
+}
+
 // Command to wait for the next update from the transfer
 func waitForTransferUpdate() tea.Msg {
 	return <-transferChannel
@@ -43,25 +62,34 @@ type transferErrorMsg struct {
 	err error
 }
 
+// Message sent when host key verification is needed
+type hostKeyVerificationMsg struct {
+	host     string
+	key      ssh.PublicKey
+	keyError ssh.HostKeyCallback // Using actual error type for more context if needed later
+}
+
 // File transfer model with authentication details
 type transferModel struct {
-	host          string
-	username      string
+	host                  string
+	username              string
 	password      string
 	keyPath       string
 	destDir       string
 	files         []string
-	status        string
-	currentFile   string
-	progress      progress.Model
-	spinner       spinner.Model
-	transferring  bool
-	complete      bool
-	err           error
-	totalFiles    int
-	filesComplete int
-	ctx           context.Context
-	cancelFunc    context.CancelFunc
+	status                string
+	currentFile           string
+	progress              progress.Model
+	spinner               spinner.Model
+	transferring          bool
+	complete              bool
+	err                   error
+	totalFiles            int
+	filesComplete         int
+	ctx                   context.Context
+	cancelFunc            context.CancelFunc
+	hostKeyDecisionChan   chan bool
+	pendingHostKey        ssh.PublicKey // Used if user accepts for a single session
 }
 
 // New constructor for key-based authentication
@@ -81,19 +109,20 @@ func newTransferModelWithKey(keyPath, username, password, host, destDir string, 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return transferModel{
-		host:         host,
-		username:     username,
-		password:     password,
-		keyPath:      keyPath,
-		destDir:      destDir,
-		files:        files,
-		progress:     p,
-		spinner:      s,
-		transferring: true,
-		totalFiles:   len(files),
-		status:       "Preparing to transfer files...",
-		ctx:          ctx,
-		cancelFunc:   cancel,
+		host:                  host,
+		username:              username,
+		password:              password,
+		keyPath:               keyPath,
+		destDir:               destDir,
+		files:                 files,
+		progress:              p,
+		spinner:               s,
+		transferring:          true,
+		totalFiles:            len(files),
+		status:                "Preparing to transfer files...",
+		ctx:                   ctx,
+		cancelFunc:            cancel,
+		hostKeyDecisionChan:   make(chan bool),
 	}
 }
 
@@ -217,18 +246,24 @@ func (m transferModel) transferFilesAsync() {
 	}
 
 	// Use proper host key verification
-	hostKeyCallback, err := getHostKeyCallback(m.host)
+	hostKeyCallback, err := getHostKeyCallback()
 	if err != nil {
-		// Fall back to insecure for development, but log warning
-		Warn("Using insecure host key verification: %v", err)
-		hostKeyCallback = ssh.InsecureIgnoreHostKey()
+		// This means known_hosts is present but malformed/unreadable.
+		transferChannel <- transferErrorMsg{err: err}
+		return
 	}
 
-	// Set up SSH client configuration
+	// Ensure host has port for knownhosts matching and dialing
+	hostPort := m.host
+	if !strings.Contains(hostPort, ":") {
+		hostPort += ":22"
+	}
+
+	// Set up initial SSH client configuration
 	config := &ssh.ClientConfig{
 		User:            m.username,
 		Auth:            auth,
-		HostKeyCallback: hostKeyCallback,
+		HostKeyCallback: hostKeyCallback, // This callback comes from knownhosts.New()
 		Timeout:         30 * time.Second,
 	}
 
@@ -247,8 +282,38 @@ func (m transferModel) transferFilesAsync() {
 
 	client, err := ssh.Dial("tcp", hostPort, config)
 	if err != nil {
-		transferChannel <- transferErrorMsg{err: fmt.Errorf("failed to connect: %v", err)}
-		return
+		keyErr, ok := err.(*knownhosts.KeyError)
+		if ok && len(keyErr.Want) > 0 { // Ensure there's a key to present
+			// Send message to UI to ask for confirmation
+			transferChannel <- hostKeyVerificationMsg{
+				host:     hostPort, // Send the host we are trying to connect to
+				key:      keyErr.Want[0],
+				keyError: keyErr, // Pass the original KeyError for fingerprinting etc.
+			}
+			// Wait for user's decision
+			decision := <-m.hostKeyDecisionChan
+			if decision { // User accepted
+				m.pendingHostKey = keyErr.Want[0] // Store the key for this session
+				// Retry connection with FixedHostKey
+				fixedKeyConfig := &ssh.ClientConfig{
+					User:            m.username,
+					Auth:            auth,
+					HostKeyCallback: ssh.FixedHostKey(m.pendingHostKey),
+					Timeout:         30 * time.Second,
+				}
+				client, err = ssh.Dial("tcp", hostPort, fixedKeyConfig)
+				if err != nil {
+					transferChannel <- transferErrorMsg{err: fmt.Errorf("failed to connect after accepting host key: %v", err)}
+					return
+				}
+			} else { // User denied
+				transferChannel <- transferErrorMsg{err: fmt.Errorf("host key verification denied by user")}
+				return
+			}
+		} else { // Not a KeyError or KeyError is malformed
+			transferChannel <- transferErrorMsg{err: fmt.Errorf("failed to connect: %v", err)}
+			return
+		}
 	}
 	defer client.Close()
 
@@ -369,10 +434,11 @@ func (m transferModel) transferFilesAsync() {
 type ProgressReader struct {
 	Reader     io.Reader
 	Size       int64
-	BytesRead  int64
-	fileName   string
-	Progress   func(int64)
-	lastUpdate time.Time
+	BytesRead           int64
+	fileName            string
+	Progress            func(int64)
+	lastUpdate          time.Time
+	lastReportedPercent int
 }
 
 func (pr *ProgressReader) Read(p []byte) (int, error) {
@@ -383,7 +449,24 @@ func (pr *ProgressReader) Read(p []byte) (int, error) {
 		// Limit progress updates to avoid UI freezing
 		now := time.Now()
 		if now.Sub(pr.lastUpdate) >= 100*time.Millisecond || pr.BytesRead == pr.Size {
-			pr.Progress(pr.BytesRead)
+			// Calculate current progress percentage
+			progress := float64(pr.BytesRead) / float64(pr.Size)
+			currentPercent := int(progress * 100)
+
+			// Send progress update if conditions are met
+			if currentPercent > pr.lastReportedPercent || pr.BytesRead == pr.Size {
+				// Ensure final update is always 1.0
+				if pr.BytesRead == pr.Size {
+					progress = 1.0
+				}
+
+				// Send the progress update
+				// Note: The actual sending is handled by the Progress callback
+				pr.Progress(pr.BytesRead)
+
+				// Update last reported percent
+				pr.lastReportedPercent = currentPercent
+			}
 			pr.lastUpdate = now
 
 			// Log transfer progress periodically

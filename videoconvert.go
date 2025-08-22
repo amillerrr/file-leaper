@@ -43,9 +43,11 @@ type backToMenuFromConvertMsg struct{}
 // Video conversion model
 type videoConvertModel struct {
 	fileSelector     fileSelectModel
-	outputFormat     textinput.Model
+	fileSelector     fileSelectModel
+	formatList       list.Model
 	qualityInput     textinput.Model
 	additionalArgs   textinput.Model
+	focusedField     int
 	converting       bool
 	complete         bool
 	currentScreen    int // 0 = file select, 1 = options, 2 = conversion
@@ -68,14 +70,26 @@ func newVideoConvertModel() videoConvertModel {
 	// Initialize file selector
 	fileSelector := newFileSelectModel()
 
-	// Initialize text inputs for output format
-	outputFormat := textinput.New()
-	outputFormat.Placeholder = "mp4"
-	outputFormat.Focus()
-	outputFormat.CharLimit = 10
-	outputFormat.Width = 20
-	outputFormat.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
-	outputFormat.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+	// Initialize file selector
+	fileSelector := newFileSelectModel()
+
+	// Supported formats for conversion
+	supportedFormats := []string{"mp4", "mov", "avi", "mkv", "webm", "flv", "wmv", "gif", "mp3", "aac", "wav", "flac", "ogg"}
+
+	// Create items for the format list
+	formatListItems := make([]list.Item, len(supportedFormats))
+	for i, format := range supportedFormats {
+		formatListItems[i] = formatListItem{title: format}
+	}
+
+	// Initialize format list
+	formatList := list.New(formatListItems, list.NewDefaultDelegate())
+	formatList.Title = "Select Output Format"
+	formatList.SetShowHelp(false)
+	formatList.SetShowStatusBar(false)
+	formatList.SetFilteringEnabled(false)
+	formatList.SetHeight(5) // Initial height, will be adjusted by WindowSizeMsg
+	formatList.SetWidth(20) // Initial width
 
 	// Initialize quality input
 	qualityInput := textinput.New()
@@ -84,6 +98,7 @@ func newVideoConvertModel() videoConvertModel {
 	qualityInput.Width = 20
 	qualityInput.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 	qualityInput.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+	qualityInput.Blur()
 
 	// Initialize additional arguments input
 	additionalArgs := textinput.New()
@@ -92,6 +107,7 @@ func newVideoConvertModel() videoConvertModel {
 	additionalArgs.Width = 40
 	additionalArgs.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 	additionalArgs.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+	additionalArgs.Blur()
 
 	// Initialize progress bar
 	prog := progress.New(
@@ -108,18 +124,18 @@ func newVideoConvertModel() videoConvertModel {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Set default values
-	outputFormat.SetValue("mp4")
 	qualityInput.SetValue("medium")
 
 	return videoConvertModel{
 		fileSelector:     fileSelector,
-		outputFormat:     outputFormat,
+		formatList:       formatList,
 		qualityInput:     qualityInput,
 		additionalArgs:   additionalArgs,
+		focusedField:     focusFormatList,
 		progress:         prog,
 		spinner:          s,
 		currentScreen:    0,
-		supportedFormats: []string{"mp4", "mov", "avi", "mkv", "webm", "flv", "wmv", "gif", "mp3", "aac", "wav", "flac", "ogg"},
+		supportedFormats: supportedFormats, // Use the locally defined slice
 		status:           "Select a video file to convert",
 		ctx:              ctx,
 		cancelFunc:       cancel,
@@ -148,6 +164,14 @@ func (m videoConvertModel) Update(msg tea.Msg) (videoConvertModel, tea.Cmd) {
 		if m.currentScreen == 0 {
 			h, v := lipgloss.NewStyle().Margin(1, 2).GetFrameSize()
 			m.fileSelector.list.SetSize(msg.Width-h, msg.Height-v)
+		} else if m.currentScreen == 1 { // Options screen
+			// Adjust list height, leave some space for other inputs and prompts
+			listHeight := msg.Height / 3
+			if listHeight < 3 { // Ensure minimum height
+				listHeight = 3
+			}
+			m.formatList.SetHeight(listHeight)
+			m.formatList.SetWidth(msg.Width / 2) // Adjust width as well
 		}
 
 	case tea.KeyMsg:
@@ -242,76 +266,101 @@ func (m videoConvertModel) Update(msg tea.Msg) (videoConvertModel, tea.Cmd) {
 		return m, cmd
 	}
 
-	// Handle updates for text inputs in options screen
+	// Handle updates for options screen
 	if m.currentScreen == 1 {
-		// First check for specific key navigation commands
-		if key, ok := msg.(tea.KeyMsg); ok {
-			switch key.String() {
-			case "tab", "shift+tab", "up", "down":
-				// Toggle focus between inputs
-				if m.outputFormat.Focused() {
-					m.outputFormat.Blur()
+		var cmd tea.Cmd
+		keyMsg, isKeyMsg := msg.(tea.KeyMsg)
+
+		if isKeyMsg {
+			switch keyMsg.String() {
+			case "tab":
+				m.focusedField = (m.focusedField + 1) % 3
+				if m.focusedField == focusFormatList {
+					m.qualityInput.Blur()
+					m.additionalArgs.Blur()
+					// List doesn't have Focus(), it's implicitly focused
+				} else if m.focusedField == focusQualityInput {
 					m.qualityInput.Focus()
 					m.additionalArgs.Blur()
-				} else if m.qualityInput.Focused() {
+				} else { // focusAdditionalArgs
 					m.qualityInput.Blur()
 					m.additionalArgs.Focus()
-					m.outputFormat.Blur()
-				} else {
-					m.additionalArgs.Blur()
-					m.outputFormat.Focus()
-					m.qualityInput.Blur()
 				}
-				return m, nil
+				return m, nil // No further command from tab
+			case "shift+tab":
+				m.focusedField = (m.focusedField - 1 + 3) % 3
+				if m.focusedField == focusFormatList {
+					m.qualityInput.Blur()
+					m.additionalArgs.Blur()
+				} else if m.focusedField == focusQualityInput {
+					m.qualityInput.Focus()
+					m.additionalArgs.Blur()
+				} else { // focusAdditionalArgs
+					m.qualityInput.Blur()
+					m.additionalArgs.Focus()
+				}
+				return m, nil // No further command from shift+tab
 
 			case "enter":
-				// Start conversion
-				if m.selectedFile != "" {
-					m.currentScreen = 2
-					m.converting = true
-
-					// Validate format
-					format := m.outputFormat.Value()
-					valid := false
-					for _, f := range m.supportedFormats {
-						if f == format {
-							valid = true
-							break
+				switch m.focusedField {
+				case focusFormatList:
+					m.focusedField = focusQualityInput
+					m.qualityInput.Focus()
+					m.additionalArgs.Blur()
+					// List remains visually "active" as it was the last to process non-navigation keys
+					return m, nil
+				case focusQualityInput:
+					m.focusedField = focusAdditionalArgs
+					m.qualityInput.Blur()
+					m.additionalArgs.Focus()
+					return m, nil
+				case focusAdditionalArgs:
+					// Start conversion only if Enter is pressed on the last field
+					if m.selectedFile != "" {
+						selectedFormatItem, ok := m.formatList.SelectedItem().(formatListItem)
+						if !ok {
+							m.err = fmt.Errorf("no format selected or invalid item type")
+							return m, nil
 						}
+						format := selectedFormatItem.Title()
+
+						// Basic validation (already from supported list, but good check)
+						isValidFormat := false
+						for _, sf := range m.supportedFormats {
+							if sf == format {
+								isValidFormat = true
+								break
+							}
+						}
+						if !isValidFormat {
+							m.err = fmt.Errorf("invalid format selected: %s", format)
+							return m, nil
+						}
+
+						m.currentScreen = 2
+						m.converting = true
+						m.destinationFile = getDestinationFilename(m.selectedFile, format)
+						m.ctx, m.cancelFunc = context.WithCancel(context.Background())
+						return m, tea.Batch(m.convertVideo(), m.spinner.Tick)
 					}
-
-					if !valid {
-						m.err = fmt.Errorf("unsupported output format: %s", format)
-						m.converting = false
-						return m, nil
-					}
-
-					// Create destination filename
-					ext := filepath.Ext(m.selectedFile)
-					baseName := strings.TrimSuffix(filepath.Base(m.selectedFile), ext)
-					outputDir := filepath.Dir(m.selectedFile)
-					m.destinationFile = filepath.Join(outputDir,
-						fmt.Sprintf("%s_converted.%s", baseName, format))
-
-					// Create new context for this conversion
-					m.ctx, m.cancelFunc = context.WithCancel(context.Background())
-
-					// Start conversion
-					return m, tea.Batch(
-						m.convertVideo(),
-						m.spinner.Tick,
-					)
+					return m, nil // Should not happen if selectedFile is empty, but good to return
 				}
 			}
 		}
 
-		// Handle input updates - try both inputs regardless of focus state
-		var cmd1, cmd2, cmd3 tea.Cmd
-		m.outputFormat, cmd1 = m.outputFormat.Update(msg)
-		m.qualityInput, cmd2 = m.qualityInput.Update(msg)
-		m.additionalArgs, cmd3 = m.additionalArgs.Update(msg)
-
-		return m, tea.Batch(cmd1, cmd2, cmd3)
+		// Route message to the focused component
+		var cmds []tea.Cmd
+		if m.focusedField == focusFormatList {
+			m.formatList, cmd = m.formatList.Update(msg)
+			cmds = append(cmds, cmd)
+		} else if m.focusedField == focusQualityInput {
+			m.qualityInput, cmd = m.qualityInput.Update(msg)
+			cmds = append(cmds, cmd)
+		} else { // focusAdditionalArgs
+			m.additionalArgs, cmd = m.additionalArgs.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
 	}
 
 	// Handle conversion screen keyboard events
@@ -370,14 +419,17 @@ func (m videoConvertModel) monitorProgress(stderr io.Reader) {
 			currentTime := float64(hours*3600) + float64(minutes*60) + seconds
 			progress := currentTime / m.duration
 
+			// Ensure progress is capped at 1.0
 			if progress > 1.0 {
 				progress = 1.0
 			}
 
 			// Limit updates to avoid overwhelming the UI
+			// It's acceptable to drop some intermediate progress messages if the channel is full,
+			// as critical completion/error messages are sent blockingly elsewhere.
 			select {
 			case videoConversionChannel <- conversionProgressMsg{
-				progress: progress,
+				progress: progress, // This progress is now capped
 				detail:   fmt.Sprintf("Time: %s", matches[0]),
 			}:
 			default:
@@ -387,11 +439,23 @@ func (m videoConvertModel) monitorProgress(stderr io.Reader) {
 	}
 }
 
+// Helper function to generate destination filename
+func getDestinationFilename(selectedFile, format string) string {
+	ext := filepath.Ext(selectedFile)
+	baseName := strings.TrimSuffix(filepath.Base(selectedFile), ext)
+	outputDir := filepath.Dir(selectedFile)
+	return filepath.Join(outputDir, fmt.Sprintf("%s_converted.%s", baseName, format))
+}
+
 // Convert the selected video file
 func (m videoConvertModel) convertVideo() tea.Cmd {
 	return func() tea.Msg {
 		// Get conversion settings
-		format := m.outputFormat.Value()
+		selectedFormatItem, ok := m.formatList.SelectedItem().(formatListItem)
+		if !ok {
+			return conversionErrorMsg{err: fmt.Errorf("could not determine selected format")}
+		}
+		format := selectedFormatItem.Title()
 		quality := m.qualityInput.Value()
 		additionalArgs := m.additionalArgs.Value()
 
@@ -441,12 +505,6 @@ func (m videoConvertModel) convertVideo() tea.Cmd {
 
 		Info("Starting video conversion: %s -> %s", m.selectedFile, m.destinationFile)
 		Debug("FFmpeg command: ffmpeg %s", strings.Join(args, " "))
-
-		// Check if ffmpeg is installed
-		_, err = exec.LookPath("ffmpeg")
-		if err != nil {
-			return conversionErrorMsg{err: fmt.Errorf("ffmpeg not found: %v", err)}
-		}
 
 		// Create command with context for cancellation
 		cmd := exec.CommandContext(m.ctx, "ffmpeg", args...)
@@ -505,35 +563,46 @@ func (m videoConvertModel) View() string {
 		content.WriteString(fmt.Sprintf("Selected file: %s\n\n", filepath.Base(m.selectedFile)))
 		content.WriteString("Conversion Options\n\n")
 
-		// Output format field
-		content.WriteString("Output Format: ")
-		content.WriteString(m.outputFormat.View())
+		// Output format list
+		content.WriteString("Output Format:\n") // Prompt for the list
+		content.WriteString(m.formatList.View())
 		content.WriteString("\n\n")
 
 		// Quality field
-		content.WriteString("Quality (low/medium/high): ")
+		qualityPrompt := "Quality (low/medium/high): "
+		if m.focusedField == focusQualityInput {
+			qualityPrompt = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render(qualityPrompt)
+		}
+		content.WriteString(qualityPrompt)
 		content.WriteString(m.qualityInput.View())
 		content.WriteString("\n\n")
 
 		// Additional arguments field
-		content.WriteString("Additional FFmpeg Arguments (optional): ")
+		argsPrompt := "Additional FFmpeg Arguments (optional): "
+		if m.focusedField == focusAdditionalArgs {
+			argsPrompt = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render(argsPrompt)
+		}
+		content.WriteString(argsPrompt)
 		content.WriteString(m.additionalArgs.View())
 		content.WriteString("\n\n")
 
 		// Help text
-		content.WriteString("Supported formats: ")
-		content.WriteString(strings.Join(m.supportedFormats, ", "))
-		content.WriteString("\n\n")
-		content.WriteString("Tab: next field | Shift+Tab: previous field | Enter: start conversion | Esc: back")
+		content.WriteString("Tab/Shift+Tab: cycle focus | Enter: next field / start conversion | Esc: back")
 
 	case 2: // Conversion progress
 		content.WriteString("Video Conversion\n\n")
+
+		selectedFormatItem, ok := m.formatList.SelectedItem().(formatListItem)
+		format := "selected_format" // Default/fallback
+		if ok {
+			format = selectedFormatItem.Title()
+		}
 
 		if m.converting {
 			content.WriteString(fmt.Sprintf("%s Converting %s to %s format...\n\n",
 				m.spinner.View(),
 				filepath.Base(m.selectedFile),
-				m.outputFormat.Value()))
+				format)) // Use selected format
 			content.WriteString(m.progress.View() + "\n")
 
 			if m.detailText != "" {
@@ -551,3 +620,29 @@ func (m videoConvertModel) View() string {
 
 	return content.String()
 }
+
+// checkFFmpegInstalled checks if ffmpeg is installed and in PATH.
+func checkFFmpegInstalled() (bool, error) {
+	_, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		// If LookPath returns an error, ffmpeg is not found or not executable
+		return false, err
+	}
+	return true, nil
+}
+
+// formatListItem implements list.Item for the format selection list.
+type formatListItem struct {
+	title string
+}
+
+func (i formatListItem) Title() string       { return i.title }
+func (i formatListItem) Description() string { return "" } // Not needed for this list
+func (i formatListItem) FilterValue() string { return i.title }
+
+// Constants for focused field in video conversion options
+const (
+	focusFormatList = iota
+	focusQualityInput
+	focusAdditionalArgs
+)
