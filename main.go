@@ -53,6 +53,8 @@ type model struct {
 	selectedFiles  []string
 	targetHost     string
 	config         *AppConfig
+	// Stored data when host key verification is in progress
+	pendingHostKeyData hostKeyVerificationMsg
 }
 
 // Custom error message type
@@ -275,8 +277,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case confirmDialogResultMsg:
 		// Handle confirmation dialog result
+		if strContext, ok := msg.context.(string); ok && strContext == "hostKeyVerification" {
+			if m.transferView.hostKeyDecisionChan != nil {
+				m.transferView.hostKeyDecisionChan <- msg.confirmed
+			}
+			// Clear pending data after decision
+			m.pendingHostKeyData = hostKeyVerificationMsg{}
+			// Return to the transfer screen, which is waiting for the decision
+			m.currentScreen = m.previousScreen
+			// The transfer screen will then update based on the decision (retry or show error)
+			return m, waitForTransferUpdate // Listen for next message from transfer goroutine
+		}
+		// Default handling for other dialogs
 		m.currentScreen = m.previousScreen
 		return m, msg.cmd
+
+	case hostKeyVerificationMsg: // New message from transfer.go
+		m.pendingHostKeyData = msg
+		m.previousScreen = m.currentScreen // Should be transferScreen
+		m.currentScreen = confirmDialogScreen
+
+		fingerprint := ssh.FingerprintSHA256(msg.key)
+		dialogMessage := fmt.Sprintf("The authenticity of host '%s' can't be established.\n%s key fingerprint is %s.\nAre you sure you want to continue connecting (this time only)?",
+			msg.host, msg.key.Type(), fingerprint)
+
+		return m, func() tea.Msg {
+			return showConfirmDialogMsg{
+				title:      "Host Key Verification",
+				message:    dialogMessage,
+				yesMessage: "Yes",
+				noMessage:  "No",
+				callback: func(confirmed bool) tea.Msg {
+					// Pass context along with the result
+					return confirmDialogResultMsg{confirmed: confirmed, context: "hostKeyVerification"}
+				},
+			}
+		}
 
 	case loadDirectoryResultMsg:
 		// Forward directory loading messages to the appropriate screen
@@ -312,38 +348,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, m.fileSelector.Init()
 
 				case "Convert Video":
-					if len(m.selectedFiles) == 0 {
-						// Show a message that files need to be selected first
+					// Check if FFmpeg is installed before proceeding
+					ffmpegInstalled, _ := checkFFmpegInstalled() // Error from checkFFmpegInstalled is ignored for now
+					if !ffmpegInstalled {
 						return m, func() tea.Msg {
 							return showConfirmDialogMsg{
-								title:      "No Files Selected",
-								message:    "Please select a file to convert first",
-								yesMessage: "Select Files",
-								noMessage:  "Cancel",
+								title:      "FFmpeg Not Found",
+								message:    "FFmpeg is required for video conversion but was not found in your system's PATH.\nPlease install FFmpeg and ensure it is in your PATH to use this feature.",
+								yesMessage: "OK",
+								noMessage:  "", // This makes it a single-button dialog
 								callback: func(confirmed bool) tea.Msg {
-									if confirmed {
-										m.fileSelector = newFileSelectModel()
-										m.fileSelector.list.SetSize(
-											m.windowSize.Width-4,
-											m.windowSize.Height-4)
-										m.currentScreen = fileSelectScreen
-										return m.fileSelector.Init()()
-									}
+									// No action needed on callback, user remains on menuScreen.
 									return nil
 								},
 							}
 						}
 					}
 
-					// Initialize the video converter with the selected file
+					// FFmpeg is installed, proceed to initialize video conversion screen.
+					// The videoConvertModel will start at its own file selection screen (currentScreen = 0).
 					m.videoConverter = newVideoConvertModel()
-					m.videoConverter.selectedFile = m.selectedFiles[0]
-					m.videoConverter.currentScreen = 1 // Skip to options screen
-
-					// Ensure the first input field has focus
-					m.videoConverter.outputFormat.Focus()
-					m.videoConverter.qualityInput.Blur()
-
+					// The videoConverter's Init method will be called, and it will handle
+					// its initial setup, including file selector sizing via WindowSizeMsg.
 					m.currentScreen = videoConvertScreen
 					return m, m.videoConverter.Init()
 
